@@ -345,6 +345,102 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
         }
     }
 
+    // Set while the activity is fully hidden (screen off / app switch), when the
+    // window's drawing surface is destroyed. Consumed on the next focus-regain.
+    private var pendingSurfaceResync = false
+
+    override fun onStop() {
+        super.onStop()
+        // The activity is no longer visible, so the system tears down our
+        // window's GPU surface. Flag that we must force it to re-acquire one
+        // when we come back. (This does NOT fire for transient focus loss such
+        // as a notification-shade pull, so we only resync when genuinely needed.)
+        pendingSurfaceResync = true
+        android.util.Log.d(TAG, "onStop -> pendingSurfaceResync=true")
+    }
+
+    override fun onStart() {
+        super.onStart()
+        android.util.Log.d(TAG, "onStart")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        android.util.Log.d(TAG, "onResume pending=$pendingSurfaceResync")
+        // PRIMARY trigger. onResume is guaranteed on unlock; this window does
+        // NOT emit onWindowFocusChanged(hasFocus=true) on keyguard dismissal
+        // (verified via logcat), so relying on focus meant the resync never ran.
+        if (pendingSurfaceResync) {
+            pendingSurfaceResync = false
+            resyncWindowSurface()
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        android.util.Log.d(TAG, "onWindowFocusChanged hasFocus=$hasFocus pending=$pendingSurfaceResync")
+        // BACKUP trigger, in case onResume ever runs before the new surface is
+        // ready (and for app-switch returns, which do fire focus).
+        if (hasFocus && pendingSurfaceResync) {
+            pendingSurfaceResync = false
+            resyncWindowSurface()
+        }
+    }
+
+    /**
+     * Recover the WebView's renderer after the window has been hidden and shown
+     * again (screen lock/unlock, app switch).
+     *
+     * To keep music playing while the screen is locked, [MyMusicWebView] fakes
+     * "window visible" so Chromium never suspends the page. The side effect is
+     * that when the screen really turns off, the system destroys the *window's*
+     * drawing surface, but — because we keep reporting "visible" — Chromium
+     * never releases its reference to it. On unlock a fresh surface exists, yet
+     * the compositor is still wedged on the dead one: it can't repaint or
+     * hit-test touches, so the whole web UI appears frozen even though audio (a
+     * separate pipeline) keeps playing. Rotating the phone fixes it because
+     * rotation makes WindowManager allocate a brand-new window surface.
+     *
+     * Rotation recovers the view by doing a full relayout that (a) reallocates
+     * the window Surface and (b) rebuilds the WebView's hardware render node /
+     * GPU draw functor against it. We reproduce BOTH halves here, since a single
+     * one has not been enough on its own:
+     *
+     *   1. window.setFormat() toggle -> WindowManager drops the current Surface
+     *      and hands back a fresh one on the next relayout (the window-level
+     *      half of what rotation does).
+     *   2. setLayerType(SOFTWARE -> HARDWARE) toggle -> the WebView tears down
+     *      its GPU render node and rebuilds it against the current surface (the
+     *      view-level half — the compositor rebinds and starts repainting).
+     *   3. webView.onResume()/resumeTimers() -> make sure Chromium itself isn't
+     *      in a paused state when we kick it.
+     *
+     * All of this is imperceptible and leaves audio untouched: nothing about
+     * window visibility or the <video>/<audio> element changes.
+     */
+    private fun resyncWindowSurface() {
+        android.util.Log.d(TAG, "resyncWindowSurface: kick start (onResume + format + layer toggle)")
+
+        // (3) Ensure the engine isn't paused.
+        webView.onResume()
+        webView.resumeTimers()
+
+        // (1) Reallocate the window surface and (2) drop the GPU render node.
+        window.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        webView.requestLayout()
+        webView.invalidate()
+
+        // Restore on a later frame so the teardown actually takes effect first.
+        webView.postDelayed({
+            window.setFormat(android.graphics.PixelFormat.OPAQUE)
+            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            webView.requestLayout()
+            webView.invalidate()
+            android.util.Log.d(TAG, "resyncWindowSurface: kick done (restored OPAQUE + HARDWARE)")
+        }, 120)
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         webView.saveState(outState)
@@ -371,6 +467,7 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
     }
 
     companion object {
+        private const val TAG = "MyMusicFreeze"
         private const val HOME_URL = "https://music.youtube.com"
 
         private const val PREFS = "mymusic_prefs"
@@ -561,22 +658,19 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
               } catch (e) {}
 
               // When we hide a YTM dialog (the "Are you still there?" / Premium
-              // upsell popups) with display:none, its full-screen modal backdrop
-              // scrim is a SEPARATE element appended to <body> that still captures
-              // every touch -> the whole app feels frozen even though audio + the
-              // notification controls keep working. Remove any backdrop that has
-              // been orphaned (no dialog is actually visible), and clear any
-              // pointer/scroll lock the overlay manager left on <body>.
+              // upsell popups) with display:none, the dialog is still "open" as
+              // far as YTM is concerned, so its modal lock stays in place:
+              //  - a full-screen backdrop scrim appended to <body>, and
+              //  - the `inert` attribute on ytmusic-app-layout (+ overflow:hidden
+              //    on <body>), which makes the browser ignore EVERY touch on the
+              //    page.
+              // Either way the whole app feels frozen even though audio + the
+              // notification controls keep working. The Premium promo pops up
+              // as soon as a song starts, so this hit on every playback.
+              // When no dialog is actually visible, properly dismiss the hidden
+              // promo and strip whatever lock it left behind.
               function clearOrphanBackdrops() {
                 try {
-                  var backdrops = document.querySelectorAll(
-                    'tp-yt-paper-dialog-backdrop,' +
-                    'tp-yt-iron-overlay-backdrop,' +
-                    '.iron-overlay-backdrop,' +
-                    '#scrim'
-                  );
-                  if (!backdrops.length) return;
-
                   // Is any modal dialog genuinely on screen (not display:none)?
                   var dialogs = document.querySelectorAll(
                     'tp-yt-paper-dialog[opened],' +
@@ -595,14 +689,33 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
                     }
                   }
 
-                  if (!anyVisible) {
-                    for (var j = 0; j < backdrops.length; j++) backdrops[j].remove();
-                    // Polymer's overlay manager can lock scroll / pointer-events
-                    // on <body> while a modal is open; release it.
-                    if (document.body) {
-                      document.body.style.pointerEvents = '';
-                      document.body.style.overflow = '';
-                    }
+                  if (anyVisible) return;
+
+                  // Close the hidden promo the "proper" way first, so YTM's own
+                  // overlay bookkeeping releases its lock.
+                  var dismiss = document.querySelector(
+                    'ytmusic-mealbar-promo-renderer .dismiss-button button,' +
+                    'ytmusic-mealbar-promo-renderer .dismiss-button'
+                  );
+                  if (dismiss && document.querySelector('[inert]')) dismiss.click();
+
+                  var backdrops = document.querySelectorAll(
+                    'tp-yt-paper-dialog-backdrop,' +
+                    'tp-yt-iron-overlay-backdrop,' +
+                    '.iron-overlay-backdrop,' +
+                    '#scrim'
+                  );
+                  for (var j = 0; j < backdrops.length; j++) backdrops[j].remove();
+
+                  // Belt and braces: release the modal lock directly.
+                  var inert = document.querySelectorAll('[inert]');
+                  for (var k = 0; k < inert.length; k++) inert[k].removeAttribute('inert');
+                  // Polymer's overlay manager can lock scroll / pointer-events
+                  // on <body> while a modal is open; release it (only when we
+                  // actually found a lock, so YTM's normal styling is untouched).
+                  if ((inert.length || backdrops.length) && document.body) {
+                    document.body.style.pointerEvents = '';
+                    document.body.style.overflow = '';
                   }
                 } catch (e) {}
               }
