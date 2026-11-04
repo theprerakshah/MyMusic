@@ -26,6 +26,11 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "TEST_HOOKS", "false")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     signingConfigs {
@@ -50,6 +55,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        // Release plus the failure-injection hooks used by scripts/device-test.sh.
+        // Signed the same, so it installs over release without losing the login.
+        // Never share this build: R8 only removes the hooks from "release".
+        create("qa") {
+            initWith(getByName("release"))
+            buildConfigField("boolean", "TEST_HOOKS", "true")
+            matchingFallbacks += "release"
         }
     }
     compileOptions {

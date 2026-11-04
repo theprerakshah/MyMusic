@@ -10,20 +10,29 @@ import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import java.io.ByteArrayInputStream
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +42,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
 
 /**
  * Phase 1: a full-screen WebView that loads YouTube Music.
@@ -71,6 +81,13 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
     // Latest system-bar insets, re-applied as root padding outside fullscreen.
     private var barInsets: Insets = Insets.NONE
 
+    // False whenever [webView] is missing or destroyed; it must not be touched then.
+    private var webViewAlive = false
+    private var currentUrl = HOME_URL
+    private var pendingWebViewRestart = false
+    private var rendererCrashTimes = emptyList<Long>()
+    private var errorOverlay: View? = null
+
     // Persisted user options (audio-only vs. video). Battery-saver on screen-off
     // is always on — it only suppresses *video* while the display is off.
     private lateinit var prefs: SharedPreferences
@@ -100,15 +117,6 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
         setContentView(root)
         insetsController = WindowInsetsControllerCompat(window, root)
 
-        webView = MyMusicWebView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-            )
-            setBackgroundColor(Color.BLACK)
-        }
-        root.addView(webView)
-
         // Pad the root by the system bars so the page sits below the status bar
         // and above the nav bar. We drop the padding while a video is fullscreen
         // so it can fill the whole screen.
@@ -120,13 +128,8 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
             WindowInsetsCompat.CONSUMED
         }
 
-        configureWebView()
-
-        if (savedInstanceState != null) {
-            webView.restoreState(savedInstanceState)
-        } else {
-            webView.loadUrl(HOME_URL)
-        }
+        currentUrl = savedInstanceState?.getString(KEY_URL) ?: HOME_URL
+        startWebView()
 
         // Ask for the notification permission (Android 13+) so the foreground
         // service can show its ongoing notification, then start the service that
@@ -156,7 +159,7 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
             override fun handleOnBackPressed() {
                 if (fullscreenView != null) {
                     webView.webChromeClient?.onHideCustomView()
-                } else if (webView.canGoBack()) {
+                } else if (webViewAlive && webView.canGoBack()) {
                     webView.goBack()
                 } else {
                     isEnabled = false
@@ -164,6 +167,100 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
                 }
             }
         })
+
+        handleTestHooks(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleTestHooks(intent)
+    }
+
+    /**
+     * Creates the WebView and loads [currentUrl]. Creation throws when the system
+     * WebView is missing, disabled or mid-update, which is recoverable by retrying.
+     */
+    private fun startWebView() {
+        hideError()
+        try {
+            if (BuildConfig.TEST_HOOKS && intent.getBooleanExtra("hook_no_webview", false)) {
+                intent.removeExtra("hook_no_webview")
+                throw android.util.AndroidRuntimeException("test hook: no WebView")
+            }
+            webView = MyMusicWebView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setBackgroundColor(Color.BLACK)
+            }
+            root.addView(webView, 0)
+            configureWebView()
+            webViewAlive = true
+            webView.loadUrl(currentUrl)
+        } catch (e: RuntimeException) {
+            android.util.Log.e(TAG, "WebView unavailable", e)
+            webViewAlive = false
+            showError("Android System WebView isn't available right now. It may be updating.") {
+                startWebView()
+            }
+        }
+    }
+
+    /**
+     * The page's renderer process died: it crashed, or Android reclaimed it for
+     * memory (likely while we're in the background). Without handling this, the
+     * WebView takes the entire app down with it. The dead WebView can't be reused,
+     * so replace it, or wait until we're visible again to avoid using memory then.
+     */
+    private fun onRendererGone(deadView: WebView) {
+        deadView.url?.let { currentUrl = it }
+        webViewAlive = false
+        playbackService?.markStopped()
+        fullscreenView?.let { root.removeView(it) }
+        fullscreenView = null
+        fullscreenCallback = null
+        applyRootInsets()
+        root.removeView(deadView)
+        deadView.destroy()
+
+        val now = System.currentTimeMillis()
+        val allowed = CrashLoopGuard.shouldRecover(rendererCrashTimes, now)
+        rendererCrashTimes = CrashLoopGuard.recentTimes(rendererCrashTimes, now) + now
+        when {
+            !allowed -> showError("YouTube Music keeps crashing.") { startWebView() }
+            lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) -> startWebView()
+            else -> pendingWebViewRestart = true
+        }
+    }
+
+    private fun showError(message: String, onRetry: () -> Unit) {
+        hideError()
+        val pad = (24 * resources.displayMetrics.density).toInt()
+        errorOverlay = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Color.BLACK)
+            isClickable = true // don't let touches reach the page underneath
+            addView(TextView(this@MainActivity).apply {
+                text = message
+                setTextColor(Color.WHITE)
+                textSize = 18f
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, pad)
+            })
+            addView(Button(this@MainActivity).apply {
+                text = "Try again"
+                setOnClickListener { onRetry() }
+            })
+        }
+        root.addView(errorOverlay)
+    }
+
+    private fun hideError() {
+        errorOverlay?.let { root.removeView(it) }
+        errorOverlay = null
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -209,6 +306,53 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
             ): Boolean {
                 val url = request.url?.toString() ?: return false
                 return !url.startsWith("http")
+            }
+
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                hideError()
+            }
+
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError,
+            ) {
+                if (!request.isForMainFrame) return
+                val failedUrl = request.url.toString()
+                showError("Can't reach YouTube Music.\nCheck your connection.") {
+                    view.loadUrl(failedUrl)
+                }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: WebResourceResponse,
+            ) {
+                if (!request.isForMainFrame || errorResponse.statusCode < 500) return
+                val failedUrl = request.url.toString()
+                showError("YouTube Music is having problems right now.") {
+                    view.loadUrl(failedUrl)
+                }
+            }
+
+            override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                // Always refuse the connection. A blocked subresource is harmless,
+                // but a blocked page would otherwise just stay blank.
+                handler.cancel()
+                val failedUrl = error.url
+                if (failedUrl == view.url) {
+                    showError("Couldn't make a secure connection.\nCheck your phone's date and network.") {
+                        view.loadUrl(failedUrl)
+                    }
+                }
+            }
+
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                android.util.Log.w(TAG, "Renderer gone, didCrash=${detail.didCrash()}")
+                onRendererGone(view)
+                return true
             }
 
             // Phase 3 (network layer): drop requests to known ad / tracking
@@ -287,27 +431,32 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
     // --- PlaybackService.CommandListener: drive the web player from the
     // notification / lock-screen transport buttons. ---
 
-    override fun onPlayCommand() = runControl("play")
+    override fun onPlayCommand() {
+        runOnUiThread {
+            // Pressing play after the renderer died in the background brings it back.
+            if (pendingWebViewRestart) {
+                pendingWebViewRestart = false
+                startWebView()
+            } else {
+                runControl("play")
+            }
+        }
+    }
+
     override fun onPauseCommand() = runControl("pause")
     override fun onNextCommand() = runControl("next")
     override fun onPreviousCommand() = runControl("previous")
 
-    override fun onSeekToCommand(positionMs: Long) {
-        runOnUiThread {
-            webView.evaluateJavascript("window.__myMusicSeek($positionMs);", null)
-        }
-    }
+    override fun onSeekToCommand(positionMs: Long) = runJs("window.__myMusicSeek($positionMs);")
 
-    private fun runControl(command: String) {
-        runOnUiThread {
-            webView.evaluateJavascript("window.__myMusicControl('$command');", null)
-        }
-    }
+    private fun runControl(command: String) = runJs("window.__myMusicControl('$command');")
 
     /** Tell the web player whether the display is currently off. */
-    private fun pushScreenOff(off: Boolean) {
+    private fun pushScreenOff(off: Boolean) = runJs("window.__myMusicSetScreenOff($off);")
+
+    private fun runJs(script: String) {
         runOnUiThread {
-            webView.evaluateJavascript("window.__myMusicSetScreenOff($off);", null)
+            if (webViewAlive) webView.evaluateJavascript(script, null)
         }
     }
 
@@ -319,17 +468,19 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
     private inner class WebMediaBridge {
         @JavascriptInterface
         fun onState(
-            title: String,
-            artist: String,
-            album: String,
-            artUrl: String,
+            // Nullable: these come from the page, and JS null arrives as Java null.
+            title: String?,
+            artist: String?,
+            album: String?,
+            artUrl: String?,
             playing: Boolean,
             positionMs: Long,
             durationMs: Long,
         ) {
-            webView.post {
+            runOnUiThread {
                 playbackService?.updateFromWeb(
-                    title, artist, album, artUrl, playing, positionMs, durationMs,
+                    title.orEmpty(), artist.orEmpty(), album.orEmpty(), artUrl.orEmpty(),
+                    playing, positionMs, durationMs,
                 )
             }
         }
@@ -362,6 +513,10 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
     override fun onStart() {
         super.onStart()
         android.util.Log.d(TAG, "onStart")
+        if (pendingWebViewRestart) {
+            pendingWebViewRestart = false
+            startWebView()
+        }
     }
 
     override fun onResume() {
@@ -419,6 +574,7 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
      * window visibility or the <video>/<audio> element changes.
      */
     private fun resyncWindowSurface() {
+        if (!webViewAlive) return
         android.util.Log.d(TAG, "resyncWindowSurface: kick start (onResume + format + layer toggle)")
 
         // (3) Ensure the engine isn't paused.
@@ -433,6 +589,7 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
 
         // Restore on a later frame so the teardown actually takes effect first.
         webView.postDelayed({
+            if (!webViewAlive) return@postDelayed
             window.setFormat(android.graphics.PixelFormat.OPAQUE)
             webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
             webView.requestLayout()
@@ -443,7 +600,34 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        webView.saveState(outState)
+        // Only the URL, never webView.saveState(): with a song playing, YouTube
+        // Music's page state exceeds 1 MB, which overflows the Binder transaction
+        // sent on every onStop and crashes with TransactionTooLargeException.
+        if (webViewAlive) webView.url?.let { currentUrl = it }
+        outState.putString(KEY_URL, currentUrl)
+
+        if (BuildConfig.TEST_HOOKS && webViewAlive) {
+            val probe = Bundle()
+            webView.saveState(probe)
+            val bytes = probe.getByteArray("WEBVIEW_CHROMIUM_STATE")?.size ?: 0
+            val history = webView.copyBackForwardList().size
+            android.util.Log.i(TAG, "probe state_bytes=$bytes history=$history path=${android.net.Uri.parse(currentUrl).path}")
+        }
+    }
+
+    /** Failure injection for scripts/device-test.sh. Compiled out of release builds. */
+    private fun handleTestHooks(intent: Intent?) {
+        if (!BuildConfig.TEST_HOOKS || intent == null) return
+        root.postDelayed({
+            intent.getStringExtra("hook_url")?.let { if (webViewAlive) webView.loadUrl(it) }
+            intent.getStringExtra("hook_js")?.let { script ->
+                if (webViewAlive) webView.evaluateJavascript(script) { android.util.Log.i(TAG, "hook_js result=$it") }
+            }
+            if (intent.getBooleanExtra("hook_throw", false)) throw RuntimeException("test hook: main thread")
+            if (intent.getBooleanExtra("hook_throw_thread", false)) {
+                Thread { throw RuntimeException("test hook: worker thread") }.start()
+            }
+        }, intent.getLongExtra("hook_delay_ms", 0))
     }
 
     override fun onDestroy() {
@@ -461,14 +645,18 @@ class MainActivity : ComponentActivity(), PlaybackService.CommandListener {
             // Was never bound; ignore.
         }
         PlaybackService.stop(this)
-        root.removeView(webView)
-        webView.destroy()
+        if (webViewAlive) {
+            webViewAlive = false
+            root.removeView(webView)
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
     companion object {
         private const val TAG = "MyMusicFreeze"
         private const val HOME_URL = "https://music.youtube.com"
+        private const val KEY_URL = "webview_url"
 
         private const val PREFS = "mymusic_prefs"
         private const val KEY_AUDIO_ONLY = "audio_only"
